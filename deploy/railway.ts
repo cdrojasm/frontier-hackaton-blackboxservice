@@ -14,7 +14,6 @@ export default defineRailway((ctx) => {
       RAILWAY_DOCKERFILE_PATH: "/deploy/backend.Dockerfile",
       DATABASE_URL: db.env.DATABASE_URL,
       FRONTEND_ORIGIN: "*",
-      ARTIFACT_BUCKET: artifacts.env.BUCKET_NAME,
     },
   });
 
@@ -22,7 +21,6 @@ export default defineRailway((ctx) => {
     healthcheck: "/",
     env: {
       RAILWAY_DOCKERFILE_PATH: "/deploy/frontend.Dockerfile",
-      API_SERVICE: api.name,
     },
   });
 
