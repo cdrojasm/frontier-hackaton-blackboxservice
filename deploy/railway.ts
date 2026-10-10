@@ -22,7 +22,7 @@ export default defineRailway((ctx) => {
       RAILWAY_DOCKERFILE_PATH: "/deploy/backend.Dockerfile",
       DATABASE_URL: db.env.DATABASE_URL,
       FRONTEND_ORIGIN: "*",
-      MIMIC_RUNTIME_URL: "http://mimic-runtime.railway.internal",
+      MIMIC_RUNTIME_URL: "http://mimic-runtime.railway.internal:8080",
     },
   });
 

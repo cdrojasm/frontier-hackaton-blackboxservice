@@ -1,11 +1,9 @@
 from uuid import UUID
-import hashlib
-import hmac
 
-from fastapi import APIRouter, Depends, HTTPException, Request, status
 import httpx
-from sqlalchemy import delete, select
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import AnyHttpUrl, BaseModel, Field
+from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from frontier_api.application.create_service import CreateServiceCommand, CreateServiceUseCase
@@ -42,22 +40,22 @@ async def api_health() -> dict[str, str]:
     return {"status": "ok"}
 
 
-@router.api_route(
-    "/mimic/{slug}/{proxy_path:path}",
-    methods=["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"],
-)
-async def mimic_gateway(slug: str, proxy_path: str, request: Request, session: AsyncSession = Depends(get_session)):
-    """Forward public mimic traffic to the private Railway runtime."""
+MIMIC_METHODS = ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"]
+
+
+@router.api_route("/mimic/{slug}", methods=MIMIC_METHODS)
+@router.api_route("/mimic/{slug}/{proxy_path:path}", methods=MIMIC_METHODS)
+async def mimic_gateway(slug: str, request: Request, proxy_path: str = "", session: AsyncSession = Depends(get_session)):
+    """Forward public mimic traffic to the private Railway runtime.
+
+    Authorization is forwarded untouched: the runtime only uses the team Bearer
+    token for POST /__reset and otherwise answers exactly like the original.
+    """
     from starlette.responses import Response
 
     clone = await session.scalar(select(ClonedServiceModel).where(ClonedServiceModel.slug == slug))
     if clone is None or not clone.enabled:
         raise HTTPException(status_code=404, detail="Mimic not found")
-    if request.method != "OPTIONS":
-        supplied = request.headers.get("x-mimic-token", "")
-        expected = clone.token_hash or ""
-        if not supplied or not hmac.compare_digest(hashlib.sha256(supplied.encode()).hexdigest(), expected):
-            raise HTTPException(status_code=401, detail="Invalid mimic token")
 
     target = f"{settings.mimic_runtime_url.rstrip('/')}/mimic/{slug}/{proxy_path}"
     if request.url.query:
@@ -65,7 +63,7 @@ async def mimic_gateway(slug: str, proxy_path: str, request: Request, session: A
     headers = {
         key: value
         for key, value in request.headers.items()
-        if key.lower() not in {"host", "content-length", "x-mimic-token"}
+        if key.lower() not in {"host", "content-length"}
     }
     body = await request.body()
     try:

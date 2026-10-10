@@ -1,7 +1,7 @@
-from datetime import datetime
 import hashlib
 import re
 import secrets
+from datetime import datetime
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -10,6 +10,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from frontier_api.artifact_store import load_artifact, store_artifact
 from frontier_api.infra.db.base import get_session
 from frontier_api.infra.db.models import (
     ClonedServiceModel,
@@ -19,8 +20,8 @@ from frontier_api.infra.db.models import (
     MimicRunModel,
     ReplayResultModel,
     RunEventModel,
-    ServiceModel,
     ServiceCredentialModel,
+    ServiceModel,
     ServiceRequestModel,
 )
 
@@ -233,14 +234,52 @@ def _slugify(value: str) -> str:
     return slug or "mimic"
 
 
+@router.get("/mimic-runs/{run_id}/iterations")
+async def list_mimic_iterations(run_id: UUID, session: AsyncSession = Depends(get_session)):
+    run = await get_model(session, MimicRunModel, run_id)
+    if not run.code_ref:
+        return []
+    try:
+        artifact = load_artifact(run.code_ref)
+    except (ValueError, OSError, KeyError):
+        return []
+    selected = artifact.get("pipeline", {}).get("selected_iteration")
+    return [
+        {key: item.get(key) for key in ("iteration", "match_rate", "matched", "total", "use_case_count", "code_ref", "endpoints", "validated")}
+        | {"selected": selected is not None and int(item.get("iteration", -1)) == int(selected)}
+        for item in artifact.get("pipeline", {}).get("iterations", [])
+    ]
+
+
 @router.post("/mimic-runs/{run_id}/approve")
-async def approve_mimic_run(run_id: UUID, session: AsyncSession = Depends(get_session)):
+async def approve_mimic_run(run_id: UUID, payload: GenericPayload | None = None, session: AsyncSession = Depends(get_session)):
     run = await get_model(session, MimicRunModel, run_id)
     if run.status != "approval_required":
-        raise HTTPException(status_code=409, detail=f"Run is not awaiting approval: {run.status}")
+        approval_event = await session.scalar(
+            select(RunEventModel)
+            .where(
+                RunEventModel.mimic_run_id == run.id,
+                RunEventModel.step == "approval_required",
+            )
+            .order_by(RunEventModel.created_at.desc())
+        )
+        if approval_event is None:
+            raise HTTPException(status_code=409, detail=f"Run is not awaiting approval: {run.status}")
+        run.status = "approval_required"
     service = await session.get(ServiceModel, run.service_id)
     if service is None:
         raise HTTPException(status_code=404, detail="Service not found")
+    selected_iteration = (payload.data if payload else {}).get("selected_iteration")
+    if selected_iteration is not None and run.code_ref:
+        try:
+            artifact = load_artifact(run.code_ref)
+            selected = next(item for item in artifact.get("pipeline", {}).get("iterations", []) if int(item.get("iteration")) == int(selected_iteration))
+            selected_spec = dict(selected["spec"])
+            selected_spec["pipeline"] = {**artifact.get("pipeline", {}), "selected_iteration": int(selected_iteration)}
+            run.code_ref = store_artifact(run.id, selected_spec, int(selected_iteration))
+            session.add(RunEventModel(mimic_run_id=run.id, step="iteration_selected", level="info", message=f"Iteration {selected_iteration} selected for approval"))
+        except (StopIteration, KeyError, TypeError, ValueError, OSError) as exc:
+            raise HTTPException(status_code=400, detail="Selected iteration is not available") from exc
     clone = await session.scalar(select(ClonedServiceModel).where(ClonedServiceModel.service_id == service.id))
     if clone is None:
         base_slug = _slugify(service.name)
@@ -273,11 +312,15 @@ async def approve_mimic_run(run_id: UUID, session: AsyncSession = Depends(get_se
 
 
 @router.post("/cloned-services/{clone_id}/ship")
-async def ship_clone(clone_id: UUID, session: AsyncSession = Depends(get_session)):
+async def ship_clone(clone_id: UUID, payload: GenericPayload | None = None, session: AsyncSession = Depends(get_session)):
     clone = await get_model(session, ClonedServiceModel, clone_id)
     if clone.active_mimic_run_id is None:
         raise HTTPException(status_code=409, detail="Clone has no approved mimic run")
-    token = secrets.token_urlsafe(32)
+    # The entrypoint contract uses the team token as Bearer for POST /__reset;
+    # accept it when provided, otherwise mint one.
+    token = str((payload.data if payload else {}).get("token") or "").strip() or secrets.token_urlsafe(32)
+    if len(token) < 8:
+        raise HTTPException(status_code=400, detail="Token must have at least 8 characters")
     clone.token_hash = hashlib.sha256(token.encode()).hexdigest()
     clone.token_prefix = token[:8]
     clone.enabled = True

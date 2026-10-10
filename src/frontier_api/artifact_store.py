@@ -22,6 +22,7 @@ def package_spec(spec: dict) -> bytes:
         manifest = {
             "format": "frontier-mimic-python-v1",
             "service_summary": spec.get("service_summary", ""),
+            "pipeline": spec.get("pipeline", {}),
             "use_cases": [],
         }
         archive.writestr("__init__.py", "")
@@ -77,7 +78,7 @@ def load_artifact(reference: str) -> dict:
             case = dict(item)
             case["handler_code"] = archive.read(item["module"]).decode("utf-8")
             cases.append(case)
-        return {"service_summary": manifest.get("service_summary", ""), "use_cases": cases}
+        return {"service_summary": manifest.get("service_summary", ""), "pipeline": manifest.get("pipeline", {}), "use_cases": cases}
 
 
 def _s3_client():

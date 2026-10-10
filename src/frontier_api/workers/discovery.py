@@ -189,6 +189,9 @@ async def _store_decision(
                 title=title,
                 content=content,
                 confidence=max(0.0, min(float(insight.get("confidence", 0.0)), 1.0)),
+                # Discovery is the approving agent in this workflow. Its
+                # evidence-backed insights are immediately eligible for Mimic.
+                status="validated",
             )
         )
         existing.add((title, content))

@@ -11,9 +11,11 @@ console.log("[frontier] UI bundle loaded", {
 type View = "overview" | "services" | "discovery" | "mimic" | "compare";
 type Service = { id: string; name: string; base_url: string; status: string; request_interval_ms: number };
 type DiscoveryRun = { id: string; service_id: string; status: string; started_at?: string | null; finished_at?: string | null; error?: string | null };
-type RunEvent = { id: string; step: string; message: string; level: string; progress_done?: number | null; progress_total?: number | null; payload?: string | null; response?: string | null; response_code?: number | null };
+type RunEvent = { id: string; step: string; message: string; level: string; created_at?: string | null; progress_done?: number | null; progress_total?: number | null; payload?: string | null; response?: string | null; response_code?: number | null };
 type Insight = { id: string; title: string; content: string; confidence: number; status: string };
 type MimicRun = { id: string; service_id: string; status: string; iterations: number; match_rate?: number | null; code_ref?: string | null; error?: string | null };
+type EndpointStat = { method: string; path: string; purpose?: string; matched: number; total: number };
+type MimicIteration = { iteration: number; match_rate: number; matched: number; total: number; use_case_count: number; code_ref?: string | null; endpoints?: EndpointStat[] | null; validated?: boolean | null; selected?: boolean };
 type Clone = { id: string; service_id: string; slug: string; enabled: boolean; token?: string };
 type SeedRequest = { method: string; path: string; payload_ref?: string | null; response_code?: number | null; response_ref?: string | null; sequence_order: number };
 const API_URL = import.meta.env.VITE_API_URL ?? "";
@@ -83,7 +85,6 @@ function Discovery({ services }: { services: Service[] }) {
   const [run, setRun] = useState<DiscoveryRun | null>(null);
   const [runs, setRuns] = useState<DiscoveryRun[]>([]);
   const [events, setEvents] = useState<RunEvent[]>([]);
-  const [clone, setClone] = useState<Clone | null>(null);
   const [insights, setInsights] = useState<Insight[]>([]);
   const [busy, setBusy] = useState(false);
   const [seedRows, setSeedRows] = useState<SeedRequest[]>([]);
@@ -128,15 +129,20 @@ function Mimic({ services }: { services: Service[] }) {
   const [runs, setRuns] = useState<MimicRun[]>([]);
   const [run, setRun] = useState<MimicRun | null>(null);
   const [events, setEvents] = useState<RunEvent[]>([]);
+  const [iterations, setIterations] = useState<MimicIteration[]>([]);
+  const [selectedIteration, setSelectedIteration] = useState<number | null>(null);
   const [clone, setClone] = useState<Clone | null>(null);
   const [busy, setBusy] = useState(false);
   useEffect(() => { if (!serviceId && services[0]) setServiceId(services[0].id); }, [services, serviceId]);
   async function refresh(runId: string) {
-    const [nextRun, nextEvents] = await Promise.all([
+    const [nextRun, nextEvents, nextIterations] = await Promise.all([
       api<MimicRun>(`/api/v1/mimic-runs/${runId}`),
       api<RunEvent[]>(`/api/v1/run-events?mimic_run_id=${runId}`),
+      api<MimicIteration[]>(`/api/v1/mimic-runs/${runId}/iterations`),
     ]);
-    setRun(nextRun); setEvents(nextEvents); setRuns(previous => previous.map(item => item.id === nextRun.id ? nextRun : item));
+    const orderedEvents = [...nextEvents].sort((left, right) => String(left.created_at ?? left.id).localeCompare(String(right.created_at ?? right.id)));
+    const recommended = nextIterations.reduce((best, item) => !best || item.match_rate > best.match_rate ? item : best, nextIterations[0]);
+    setRun(nextRun); setEvents(orderedEvents); setIterations(nextIterations); setSelectedIteration(current => current ?? recommended?.iteration ?? null); setRuns(previous => previous.map(item => item.id === nextRun.id ? nextRun : item));
   }
   async function loadRuns(selectedServiceId: string) {
     const [history, clones] = await Promise.all([
@@ -145,7 +151,7 @@ function Mimic({ services }: { services: Service[] }) {
     ]);
     setClone(clones.find(item => item.service_id === selectedServiceId) ?? null);
     const ordered = [...history].reverse(); setRuns(ordered);
-    if (ordered[0]) await refresh(ordered[0].id); else { setRun(null); setEvents([]); }
+    if (ordered[0]) await refresh(ordered[0].id); else { setRun(null); setEvents([]); setIterations([]); setSelectedIteration(null); }
   }
   useEffect(() => { if (serviceId) void loadRuns(serviceId).catch(() => undefined); }, [serviceId]);
   useEffect(() => {
@@ -158,23 +164,66 @@ function Mimic({ services }: { services: Service[] }) {
     setBusy(true);
     try {
       const created = await api<MimicRun>(`/api/v1/services/${serviceId}/mimic-runs`, { method: "POST", body: JSON.stringify({ data: {} }) });
-      setRuns(previous => [created, ...previous]); setRun(created); setEvents([]); await refresh(created.id);
+      setRuns(previous => [created, ...previous]); setRun(created); setEvents([]); setIterations([]); setSelectedIteration(null); await refresh(created.id);
     } catch (error) { setEvents([{ id: "error", step: "failed", level: "error", message: error instanceof Error ? error.message : "No fue posible iniciar el mimic" }]); }
     finally { setBusy(false); }
   }
   async function approve() {
     if (!run) return;
-    const result = await api<{ run: MimicRun; clone: Clone }>(`/api/v1/mimic-runs/${run.id}/approve`, { method: "POST" });
-    setRun(result.run); setClone(result.clone);
+    setBusy(true);
+    try {
+      const result = await api<{ run: MimicRun; clone: Clone }>(`/api/v1/mimic-runs/${run.id}/approve`, { method: "POST", body: JSON.stringify({ data: { selected_iteration: selectedIteration } }) });
+      setRun(result.run); setClone(result.clone); await refresh(result.run.id);
+    } finally { setBusy(false); }
   }
-  async function ship() {
+  async function ship(token: string) {
     if (!clone) return;
-    const result = await api<Clone & { token: string }>(`/api/v1/cloned-services/${clone.id}/ship`, { method: "POST" });
-    setClone({ ...result, token: result.token });
+    const result = await api<{ clone: Clone; token: string }>(`/api/v1/cloned-services/${clone.id}/ship`, { method: "POST", body: JSON.stringify({ data: token ? { token } : {} }) });
+    setClone({ ...result.clone, token: result.token });
   }
   let generatedSpec: { service_summary?: string; use_cases?: { name: string; method: string; path: string; behavior: string }[] } | null = null;
   if (run?.code_ref?.startsWith("inline:")) { try { generatedSpec = JSON.parse(run.code_ref.slice(7)); } catch { generatedSpec = null; } }
-  return <section className="panel"><div className="panel-head"><div><span className="section-label">UC-03 / UC-06</span><h3>Generación y replay</h3></div><div className="discovery-actions"><select disabled={!services.length || busy} value={serviceId} onChange={e => setServiceId(e.target.value)}>{services.map(service => <option key={service.id} value={service.id}>{service.name}</option>)}</select><button disabled={!services.length || busy} onClick={() => void startMimic()}>{busy ? "Iniciando…" : "Nuevo mimic"}</button></div></div>{!services.length ? <Empty text="Registra un servicio antes de iniciar un mimic." /> : <><div className="discovery-status"><strong>{run?.status ?? "ready"}</strong><span>{run?.error ?? events[events.length - 1]?.message ?? "El generador usará insights validados y evidencia observada."}</span></div>{run?.match_rate !== null && run?.match_rate !== undefined && <div className="metric"><small>Replay match rate</small><strong>{Math.round(run.match_rate * 100)}%</strong><span>{run.iterations} iteración(es)</span></div>}{run?.status === "approval_required" && <button onClick={() => void approve()}>Aprobar artefacto</button>}{run?.status === "ready" && clone && !clone.enabled && <button onClick={() => void ship()}>Hacer ship</button>}{clone?.token && <div className="notice">Token generado una sola vez: {clone.token}</div>}<div className="timeline">{[["01", "Insights validados", "El worker selecciona los insights aprobados del servicio."], ["02", "Generación", "El modelo construye contratos de use cases trazables a la evidencia."], ["03", "Replay", "Las secuencias se reproducen contra el runtime generado."], ["04", "Approval required", "La UI muestra el resultado antes de habilitar el clon."]].map(([n, title, text]) => <div className="timeline-row" key={n}><span>{n}</span><div><strong>{title}</strong><p>{text}</p></div><em>{run?.status ?? "pendiente"}</em></div>)}</div>{events.length > 0 && <><span className="section-label">EVENTOS</span><div className="timeline">{events.slice(-8).map(event => <div className="timeline-row" key={event.id}><span>·</span><div><strong>{event.step}</strong><p>{event.message}</p></div><em>{event.level}</em></div>)}</div></>}{generatedSpec?.use_cases?.length ? <div className="insight-list"><span className="section-label">USE CASES GENERADOS</span>{generatedSpec.use_cases.map(item => <article className="insight" key={`${item.method}-${item.path}`}><strong>{item.method} {item.path} · {item.name}</strong><p>{item.behavior}</p></article>)}</div> : null}</>}</section>;
+  const phaseRows = [["design", "Design básico"], ["rules", "Reglas de negocio"], ["tasks", "Tasks trazables"], ["generated", "Implementación"], ["replaying", "Replay"]];
+  const phaseEvent = (name: string) => events.find(event => event.step === `${name}_completed`) ?? events.find(event => event.step === name);
+  const approvalReady = run?.status === "approval_required" || (run?.status !== "ready" && events.some(event => event.step === "approval_required"));
+  const bestIteration = iterations.reduce<MimicIteration | undefined>((best, item) => !best || item.match_rate > best.match_rate ? item : best, undefined);
+  const approvedIteration = iterations.find(item => item.selected) ?? iterations.find(item => item.iteration === selectedIteration) ?? bestIteration;
+  return <section className="panel"><div className="panel-head"><div><span className="section-label">UC-03 / UC-06</span><h3>Generación y replay</h3></div><div className="discovery-actions"><select disabled={!services.length || busy} value={serviceId} onChange={e => setServiceId(e.target.value)}>{services.map(service => <option key={service.id} value={service.id}>{service.name}</option>)}</select><button disabled={!services.length || busy} onClick={() => void startMimic()}>{busy ? "Iniciando…" : "Nuevo mimic"}</button></div></div>{!services.length ? <Empty text="Registra un servicio antes de iniciar un mimic." /> : <><div className="discovery-status"><strong>{approvalReady ? "approval_required" : run?.status ?? "ready"}</strong><span>{run?.error ?? events[events.length - 1]?.message ?? "El generador usará insights validados y evidencia observada."}</span></div>{run && !approvalReady && !["ready", "failed", "cancelled"].includes(run.status) && <div className="live-update"><span className="live-dot" /> <strong>En vivo</strong><span>Iteración {run.iterations || 1} · actualización automática cada 2.5 s</span></div>}<div className="phase-grid">{phaseRows.map(([key, label]) => <div className={`phase-card ${phaseEvent(key) ? "done" : ""}`} key={key}><span>{phaseEvent(key) ? "✓" : "·"}</span><strong>{label}</strong><small>{phaseEvent(key)?.message ?? "Pendiente"}</small></div>)}</div>{iterations.length > 0 && <><span className="section-label">ITERACIONES DISPONIBLES</span><div className="iteration-picker">{iterations.map(item => <button type="button" className={selectedIteration === item.iteration ? "iteration-card selected" : "iteration-card"} key={item.iteration} onClick={() => setSelectedIteration(item.iteration)}><strong>Iteración {item.iteration}</strong><b>{Math.round(item.match_rate * 100)}%</b><small>{item.matched}/{item.total} requests · {item.use_case_count} use cases</small></button>)}</div></>}{run?.match_rate !== null && run?.match_rate !== undefined && <div className="metric"><small>Replay match rate</small><strong>{Math.round(run.match_rate * 100)}%</strong><span>{run.iterations} iteración(es)</span></div>}{approvalReady && <div className="approve-bar"><div><strong>Listo para revisión</strong><span>{approvedIteration ? `Iteración ${approvedIteration.iteration} · ${approvedIteration.matched}/${approvedIteration.total} tests pasados` : "Revisa el resultado del replay antes de aprobar."}</span></div><button className="btn btn-primary" disabled={busy} onClick={() => void approve()}>{busy ? "Aprobando…" : `Aprobar iteración ${selectedIteration ?? run?.iterations}`}</button></div>}{run?.status === "ready" && clone && <EndpointCard clone={clone} iteration={approvedIteration} onShip={ship} />}<div className="timeline">{[["01", "Insights validados", "El worker selecciona los insights aprobados del servicio."], ["02", "Generación", "El modelo construye contratos de use cases trazables a la evidencia."], ["03", "Replay", "Las secuencias se reproducen contra el runtime generado."], ["04", "Approval required", "La UI muestra el resultado antes de habilitar el clon."]].map(([n, title, text]) => <div className="timeline-row" key={n}><span>{n}</span><div><strong>{title}</strong><p>{text}</p></div><em>{approvalReady ? "APPROVAL_REQUIRED" : run?.status ?? "pendiente"}</em></div>)}</div>{events.length > 0 && <><span className="section-label">EVENTOS EN VIVO</span><div className="timeline">{events.slice(-12).map(event => <div className="timeline-row" key={event.id}><span>·</span><div><strong>{event.step}</strong><p>{event.message}</p></div><em>{event.level}</em></div>)}</div></>}{generatedSpec?.use_cases?.length ? <div className="insight-list"><span className="section-label">USE CASES GENERADOS</span>{generatedSpec.use_cases.map(item => <article className="insight" key={`${item.method}-${item.path}`}><strong>{item.method} {item.path} · {item.name}</strong><p>{item.behavior}</p></article>)}</div> : null}</>}</section>;
+}
+function EndpointCard({ clone, iteration, onShip }: { clone: Clone; iteration?: MimicIteration; onShip: (token: string) => Promise<void> }) {
+  const [token, setToken] = useState("");
+  const [shipping, setShipping] = useState(false);
+  const [copied, setCopied] = useState("");
+  const [error, setError] = useState("");
+  const baseUrl = `${API_URL || window.location.origin}/mimic/${clone.slug}`;
+  const bearer = clone.token ?? "<token>";
+  const rate = iteration ? Math.round(iteration.match_rate * 100) : null;
+  const tone = (value: number) => value >= 0.95 ? "good" : value >= 0.6 ? "mid" : "low";
+  const copy = (label: string, text: string) => { void navigator.clipboard?.writeText(text); setCopied(label); window.setTimeout(() => setCopied(""), 1500); };
+  async function publish() {
+    setShipping(true); setError("");
+    try { await onShip(token.trim()); setToken(""); } catch (err) { setError(err instanceof Error ? err.message : "No fue posible publicar"); } finally { setShipping(false); }
+  }
+  const snippets: [string, string][] = [
+    ["Health", `curl ${baseUrl}/health -H "Authorization: Bearer ${bearer}"`],
+    ["Reset", `curl -X POST ${baseUrl}/__reset -H "Authorization: Bearer ${bearer}"`],
+    ["Request", `curl ${baseUrl}${iteration?.endpoints?.find(item => item.method !== "*")?.path ?? "/<ruta>"} -H "Authorization: Bearer ${bearer}"`],
+  ];
+  return <div className="endpoint-card">
+    <div className="endpoint-head"><div><span className="section-label">ENTRYPOINT DEL REEMPLAZO</span><h4>{clone.slug}</h4></div><span className={`state-pill ${clone.enabled ? "on" : "off"}`}><i />{clone.enabled ? "Publicado" : "Aprobado · sin publicar"}</span></div>
+    <div className="url-row"><span>BASE URL</span><code>{baseUrl}</code><button className="btn btn-ghost" onClick={() => copy("url", baseUrl)}>{copied === "url" ? "Copiado ✓" : "Copiar"}</button></div>
+    {iteration && rate !== null && <div className="stats-row">
+      <div className="stat"><small>Iteración aprobada</small><strong>#{iteration.iteration}</strong>{iteration.validated && <span className="tag">validada en DB</span>}</div>
+      <div className="stat"><small>Tests pasados</small><strong>{iteration.matched}<em>/{iteration.total}</em></strong><span className="tag">{iteration.total - iteration.matched} fallidos</span></div>
+      <div className="stat"><small>Match rate</small><strong className={`tone-${tone(iteration.match_rate)}`}>{rate}%</strong><div className="bar"><span className={`tone-bg-${tone(iteration.match_rate)}`} style={{ width: `${rate}%` }} /></div></div>
+      <div className="stat"><small>Use cases</small><strong>{iteration.use_case_count}</strong><span className="tag">handlers generados</span></div>
+    </div>}
+    {iteration?.endpoints?.length ? <div className="endpoint-table"><span className="section-label">RESULTADO POR ENDPOINT</span>{iteration.endpoints.map(item => { const ratio = item.total ? item.matched / item.total : 0; return <div className="endpoint-row" key={`${item.method} ${item.path}`}><span className={`method m-${item.method === "*" ? "any" : item.method.toLowerCase()}`}>{item.method === "*" ? "ANY" : item.method}</span><code title={item.purpose}>{item.path === "*" ? "rutas inexistentes (404)" : item.path}</code><div className="bar"><span className={`tone-bg-${tone(ratio)}`} style={{ width: `${Math.round(ratio * 100)}%` }} /></div><b>{item.matched}/{item.total}</b></div>; })}</div> : null}
+    <div className="ship-row"><input placeholder="Token del equipo (vacío = generar uno)" value={token} onChange={event => setToken(event.target.value)} /><button className="btn btn-primary" disabled={shipping} onClick={() => void publish()}>{shipping ? "Publicando…" : clone.enabled ? "Actualizar token" : "Publicar endpoint"}</button></div>
+    {error && <div className="notice">{error}</div>}
+    {clone.token && <div className="token-box"><div><small>TOKEN · SE MUESTRA UNA SOLA VEZ</small><code>{clone.token}</code></div><button className="btn btn-ghost" onClick={() => copy("token", clone.token ?? "")}>{copied === "token" ? "Copiado ✓" : "Copiar"}</button></div>}
+    <div className="snippets"><span className="section-label">CONTRATO · Authorization: Bearer &lt;token&gt;</span>{snippets.map(([label, command]) => <div className="snippet" key={label}><span>{label}</span><code>{command}</code><button className="btn btn-ghost" onClick={() => copy(label, command)}>{copied === label ? "✓" : "Copiar"}</button></div>)}</div>
+  </div>;
 }
 function Compare() { return <section className="panel"><div className="panel-head"><div><span className="section-label">UC-05</span><h3>Comparador original vs. clon</h3></div><span className="pill">EN MEMORIA</span></div><Empty text="Aquí podrás enviar una request al original y al clon y revisar su diff." /></section>; }
 function Metric({ label, value, hint }: { label: string; value: string | number; hint: string }) { return <div className="metric"><small>{label}</small><strong>{value}</strong><span>{hint}</span></div>; }
