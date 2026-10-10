@@ -82,8 +82,8 @@ El worker envía las credenciales activas del servicio como headers. También so
 contexto enviado al modelo.
 
 En Railway, `railway config plan` debe mostrar los servicios `api`, `app`,
-`discovery-worker` y `mimic-worker`. Después de aplicar la configuración, ambos
-workers no necesitan dominio público; solo comparten `DATABASE_URL` con la API.
+`discovery-worker`, `mimic-worker` y `mimic-runtime`. Los workers y el runtime no
+necesitan dominio público; comparten `DATABASE_URL` con la API.
 
 ### Mimic worker
 
@@ -104,11 +104,30 @@ worker no expone puerto ni dominio público y se configura con:
 - `MIMIC_MATCH_THRESHOLD`: porcentaje mínimo para detener la iteración.
 - `MIMIC_REQUEST_TIMEOUT_SECONDS`: timeout de cada replay.
 - `MIMIC_OPENROUTER_MODEL`: modelo de código usado para construir los use cases.
+- `ARTIFACTS_BUCKET`: bucket S3-compatible donde se guardan los paquetes Python.
 
-El código generado debe persistirse en el bucket `artifacts`; el run permanece en
+El código generado se empaqueta como ZIP Python y se persiste en el bucket
+`artifacts`; el run permanece en
 `approval_required` hasta que el usuario apruebe el resultado. El despliegue del
 clon se mantiene separado de la generación para que ninguna réplica pueda hacer
 ship automáticamente.
+
+En Railway la conexión más simple será un único servicio privado
+`mimic-runtime`. El API seguirá siendo el gateway público y reenviará
+`/mimic/{slug}/{proxy+}` a `http://mimic-runtime.railway.internal`. El runtime
+descarga el artefacto aprobado desde `artifacts`, carga sus use cases y responde
+la ruta solicitada. No se crean servicios Railway por cada mimic: todos los
+clones viven en el mismo runtime y se seleccionan por `slug` y versión activa.
+
+El worker genera un artefacto versionado con el contrato de rutas y handlers; el
+runtime es el único proceso que lo ejecuta. Así el API no necesita conocer el
+código generado ni reiniciarse cada vez que se publica una nueva versión.
+
+La carga es dinámica: cada request consulta el `active_mimic_run_id` del slug.
+Si cambió respecto al handler que está en memoria, el runtime descarga la nueva
+versión y la reemplaza sin reiniciar el proceso. `MIMIC_RUNTIME_REFRESH_SECONDS=0`
+mantiene este comportamiento inmediato; cada réplica de Railway actualiza su
+propia caché en la siguiente request.
 
 En la pantalla Discovery se puede cargar un CSV con estas columnas:
 
@@ -125,9 +144,9 @@ agente ReAct agrega probes adicionales automáticamente.
 
 1. Migraciones versionadas con Alembic y ejecución pre-deploy en Railway.
 2. Autenticación, tenancy y autorización por proyecto.
-3. Worker de mimic y almacenamiento de artefactos/payloads en S3-compatible.
-4. Integración con almacenamiento de artefactos y proveedor LLM.
-5. Gateway `/mimic/{slug}/{proxy+}` y runtime multi-clon.
+3. Migrar los payloads de discovery a S3-compatible y completar redacción de headers.
+4. Deploy real de handlers aprobados como runtime multi-clon.
+5. Tests de integración con PostgreSQL/Railway y rollback de artefactos.
 6. Tests unitarios, integración con PostgreSQL y CI.
 7. Observabilidad, rate limits, SSRF protection y gestión de secretos.
 

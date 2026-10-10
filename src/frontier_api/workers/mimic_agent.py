@@ -8,7 +8,6 @@ from typing import Any
 
 from openai import AsyncOpenAI
 
-
 MIMIC_SCHEMA: dict[str, Any] = {
     "type": "object",
     "additionalProperties": False,
@@ -26,8 +25,9 @@ MIMIC_SCHEMA: dict[str, Any] = {
                     "behavior": {"type": "string"},
                     "validation": {"type": "array", "items": {"type": "string"}},
                     "response_examples": {"type": "array", "items": {"type": "object"}},
+                    "handler_code": {"type": "string"},
                 },
-                "required": ["name", "method", "path", "behavior", "validation", "response_examples"],
+                "required": ["name", "method", "path", "behavior", "validation", "response_examples", "handler_code"],
             },
         },
     },
@@ -50,12 +50,13 @@ def _client() -> AsyncOpenAI:
 
 
 async def generate_spec(
-    *, service_name: str, base_url: str, insights: list[dict[str, Any]], evidence: list[dict[str, Any]], iteration: int
+    *, service_name: str, base_url: str, insights: list[dict[str, Any]], evidence: list[dict[str, Any]], iteration: int, feedback: str = ""
 ) -> dict[str, Any]:
     prompt = {
         "service_name": service_name,
         "base_url": base_url,
         "iteration": iteration,
+        "previous_replay_feedback": feedback,
         "validated_insights": insights,
         "observed_evidence": evidence[-120:],
         "constraints": [
@@ -64,6 +65,9 @@ async def generate_spec(
             "Preserve HTTP methods, relative paths, status codes, validation and response shapes.",
             "Do not include secrets, authorization values, or external calls.",
             "The result will later be compiled into isolated handlers backed by mimic_records.",
+            "handler_code must define async def handler(req, ctx) and use only req, ctx, Response.",
+            "Use await ctx.store.table('name').get/put/delete/list/next_id for state.",
+            "Do not import packages, make network calls, access the filesystem, or read environment variables.",
         ],
     }
     client = _client()

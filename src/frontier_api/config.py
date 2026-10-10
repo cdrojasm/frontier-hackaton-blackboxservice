@@ -9,6 +9,7 @@ class Settings(BaseSettings):
     log_level: str = "INFO"
     database_url: str = "postgresql+psycopg://postgres:postgres@localhost:5432/frontier"
     frontend_origin: str = "http://localhost:5173"
+    mimic_runtime_url: str = "http://localhost:8001"
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 

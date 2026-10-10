@@ -14,6 +14,7 @@ type DiscoveryRun = { id: string; service_id: string; status: string; started_at
 type RunEvent = { id: string; step: string; message: string; level: string; progress_done?: number | null; progress_total?: number | null; payload?: string | null; response?: string | null; response_code?: number | null };
 type Insight = { id: string; title: string; content: string; confidence: number; status: string };
 type MimicRun = { id: string; service_id: string; status: string; iterations: number; match_rate?: number | null; code_ref?: string | null; error?: string | null };
+type Clone = { id: string; service_id: string; slug: string; enabled: boolean; token?: string };
 type SeedRequest = { method: string; path: string; payload_ref?: string | null; response_code?: number | null; response_ref?: string | null; sequence_order: number };
 const API_URL = import.meta.env.VITE_API_URL ?? "";
 
@@ -82,6 +83,7 @@ function Discovery({ services }: { services: Service[] }) {
   const [run, setRun] = useState<DiscoveryRun | null>(null);
   const [runs, setRuns] = useState<DiscoveryRun[]>([]);
   const [events, setEvents] = useState<RunEvent[]>([]);
+  const [clone, setClone] = useState<Clone | null>(null);
   const [insights, setInsights] = useState<Insight[]>([]);
   const [busy, setBusy] = useState(false);
   const [seedRows, setSeedRows] = useState<SeedRequest[]>([]);
@@ -126,6 +128,7 @@ function Mimic({ services }: { services: Service[] }) {
   const [runs, setRuns] = useState<MimicRun[]>([]);
   const [run, setRun] = useState<MimicRun | null>(null);
   const [events, setEvents] = useState<RunEvent[]>([]);
+  const [clone, setClone] = useState<Clone | null>(null);
   const [busy, setBusy] = useState(false);
   useEffect(() => { if (!serviceId && services[0]) setServiceId(services[0].id); }, [services, serviceId]);
   async function refresh(runId: string) {
@@ -136,7 +139,11 @@ function Mimic({ services }: { services: Service[] }) {
     setRun(nextRun); setEvents(nextEvents); setRuns(previous => previous.map(item => item.id === nextRun.id ? nextRun : item));
   }
   async function loadRuns(selectedServiceId: string) {
-    const history = await api<MimicRun[]>(`/api/v1/mimic-runs?service_id=${selectedServiceId}`);
+    const [history, clones] = await Promise.all([
+      api<MimicRun[]>(`/api/v1/mimic-runs?service_id=${selectedServiceId}`),
+      api<Clone[]>("/api/v1/cloned-services"),
+    ]);
+    setClone(clones.find(item => item.service_id === selectedServiceId) ?? null);
     const ordered = [...history].reverse(); setRuns(ordered);
     if (ordered[0]) await refresh(ordered[0].id); else { setRun(null); setEvents([]); }
   }
@@ -155,9 +162,19 @@ function Mimic({ services }: { services: Service[] }) {
     } catch (error) { setEvents([{ id: "error", step: "failed", level: "error", message: error instanceof Error ? error.message : "No fue posible iniciar el mimic" }]); }
     finally { setBusy(false); }
   }
+  async function approve() {
+    if (!run) return;
+    const result = await api<{ run: MimicRun; clone: Clone }>(`/api/v1/mimic-runs/${run.id}/approve`, { method: "POST" });
+    setRun(result.run); setClone(result.clone);
+  }
+  async function ship() {
+    if (!clone) return;
+    const result = await api<Clone & { token: string }>(`/api/v1/cloned-services/${clone.id}/ship`, { method: "POST" });
+    setClone({ ...result, token: result.token });
+  }
   let generatedSpec: { service_summary?: string; use_cases?: { name: string; method: string; path: string; behavior: string }[] } | null = null;
   if (run?.code_ref?.startsWith("inline:")) { try { generatedSpec = JSON.parse(run.code_ref.slice(7)); } catch { generatedSpec = null; } }
-  return <section className="panel"><div className="panel-head"><div><span className="section-label">UC-03 / UC-06</span><h3>Generación y replay</h3></div><div className="discovery-actions"><select disabled={!services.length || busy} value={serviceId} onChange={e => setServiceId(e.target.value)}>{services.map(service => <option key={service.id} value={service.id}>{service.name}</option>)}</select><button disabled={!services.length || busy} onClick={() => void startMimic()}>{busy ? "Iniciando…" : "Nuevo mimic"}</button></div></div>{!services.length ? <Empty text="Registra un servicio antes de iniciar un mimic." /> : <><div className="discovery-status"><strong>{run?.status ?? "ready"}</strong><span>{run?.error ?? events[events.length - 1]?.message ?? "El generador usará insights validados y evidencia observada."}</span></div><div className="timeline">{[["01", "Insights validados", "El worker selecciona los insights aprobados del servicio."], ["02", "Generación", "El modelo construye contratos de use cases trazables a la evidencia."], ["03", "Replay", "Las secuencias se reproducen contra el runtime generado."], ["04", "Approval required", "La UI muestra el resultado antes de habilitar el clon."]].map(([n, title, text]) => <div className="timeline-row" key={n}><span>{n}</span><div><strong>{title}</strong><p>{text}</p></div><em>{run?.status ?? "pendiente"}</em></div>)}</div>{events.length > 0 && <><span className="section-label">EVENTOS</span><div className="timeline">{events.slice(-8).map(event => <div className="timeline-row" key={event.id}><span>·</span><div><strong>{event.step}</strong><p>{event.message}</p></div><em>{event.level}</em></div>)}</div></>}{generatedSpec?.use_cases?.length ? <div className="insight-list"><span className="section-label">USE CASES GENERADOS</span>{generatedSpec.use_cases.map(item => <article className="insight" key={`${item.method}-${item.path}`}><strong>{item.method} {item.path} · {item.name}</strong><p>{item.behavior}</p></article>)}</div> : null}</>}</section>;
+  return <section className="panel"><div className="panel-head"><div><span className="section-label">UC-03 / UC-06</span><h3>Generación y replay</h3></div><div className="discovery-actions"><select disabled={!services.length || busy} value={serviceId} onChange={e => setServiceId(e.target.value)}>{services.map(service => <option key={service.id} value={service.id}>{service.name}</option>)}</select><button disabled={!services.length || busy} onClick={() => void startMimic()}>{busy ? "Iniciando…" : "Nuevo mimic"}</button></div></div>{!services.length ? <Empty text="Registra un servicio antes de iniciar un mimic." /> : <><div className="discovery-status"><strong>{run?.status ?? "ready"}</strong><span>{run?.error ?? events[events.length - 1]?.message ?? "El generador usará insights validados y evidencia observada."}</span></div>{run?.match_rate !== null && run?.match_rate !== undefined && <div className="metric"><small>Replay match rate</small><strong>{Math.round(run.match_rate * 100)}%</strong><span>{run.iterations} iteración(es)</span></div>}{run?.status === "approval_required" && <button onClick={() => void approve()}>Aprobar artefacto</button>}{run?.status === "ready" && clone && !clone.enabled && <button onClick={() => void ship()}>Hacer ship</button>}{clone?.token && <div className="notice">Token generado una sola vez: {clone.token}</div>}<div className="timeline">{[["01", "Insights validados", "El worker selecciona los insights aprobados del servicio."], ["02", "Generación", "El modelo construye contratos de use cases trazables a la evidencia."], ["03", "Replay", "Las secuencias se reproducen contra el runtime generado."], ["04", "Approval required", "La UI muestra el resultado antes de habilitar el clon."]].map(([n, title, text]) => <div className="timeline-row" key={n}><span>{n}</span><div><strong>{title}</strong><p>{text}</p></div><em>{run?.status ?? "pendiente"}</em></div>)}</div>{events.length > 0 && <><span className="section-label">EVENTOS</span><div className="timeline">{events.slice(-8).map(event => <div className="timeline-row" key={event.id}><span>·</span><div><strong>{event.step}</strong><p>{event.message}</p></div><em>{event.level}</em></div>)}</div></>}{generatedSpec?.use_cases?.length ? <div className="insight-list"><span className="section-label">USE CASES GENERADOS</span>{generatedSpec.use_cases.map(item => <article className="insight" key={`${item.method}-${item.path}`}><strong>{item.method} {item.path} · {item.name}</strong><p>{item.behavior}</p></article>)}</div> : null}</>}</section>;
 }
 function Compare() { return <section className="panel"><div className="panel-head"><div><span className="section-label">UC-05</span><h3>Comparador original vs. clon</h3></div><span className="pill">EN MEMORIA</span></div><Empty text="Aquí podrás enviar una request al original y al clon y revisar su diff." /></section>; }
 function Metric({ label, value, hint }: { label: string; value: string | number; hint: string }) { return <div className="metric"><small>{label}</small><strong>{value}</strong><span>{hint}</span></div>; }

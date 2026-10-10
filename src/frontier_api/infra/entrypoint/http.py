@@ -1,15 +1,21 @@
 from uuid import UUID
+import hashlib
+import hmac
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
+import httpx
 from sqlalchemy import delete, select
 from pydantic import AnyHttpUrl, BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from frontier_api.application.create_service import CreateServiceCommand, CreateServiceUseCase
+from frontier_api.config import get_settings
 from frontier_api.infra.db.base import get_session
+from frontier_api.infra.db.models import ClonedServiceModel
 from frontier_api.infra.factory.service_factory import ServiceFactory
 
 router = APIRouter()
+settings = get_settings()
 
 
 class CreateServiceRequest(BaseModel):
@@ -34,6 +40,51 @@ async def health() -> dict[str, str]:
 @router.get("/api/health")
 async def api_health() -> dict[str, str]:
     return {"status": "ok"}
+
+
+@router.api_route(
+    "/mimic/{slug}/{proxy_path:path}",
+    methods=["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"],
+)
+async def mimic_gateway(slug: str, proxy_path: str, request: Request, session: AsyncSession = Depends(get_session)):
+    """Forward public mimic traffic to the private Railway runtime."""
+    from starlette.responses import Response
+
+    clone = await session.scalar(select(ClonedServiceModel).where(ClonedServiceModel.slug == slug))
+    if clone is None or not clone.enabled:
+        raise HTTPException(status_code=404, detail="Mimic not found")
+    if request.method != "OPTIONS":
+        supplied = request.headers.get("x-mimic-token", "")
+        expected = clone.token_hash or ""
+        if not supplied or not hmac.compare_digest(hashlib.sha256(supplied.encode()).hexdigest(), expected):
+            raise HTTPException(status_code=401, detail="Invalid mimic token")
+
+    target = f"{settings.mimic_runtime_url.rstrip('/')}/mimic/{slug}/{proxy_path}"
+    if request.url.query:
+        target = f"{target}?{request.url.query}"
+    headers = {
+        key: value
+        for key, value in request.headers.items()
+        if key.lower() not in {"host", "content-length", "x-mimic-token"}
+    }
+    body = await request.body()
+    try:
+        async with httpx.AsyncClient(timeout=30, follow_redirects=False) as client:
+            upstream = await client.request(request.method, target, headers=headers, content=body)
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=502, detail=f"Mimic runtime unavailable: {exc}") from exc
+
+    response_headers = {
+        key: value
+        for key, value in upstream.headers.items()
+        if key.lower() not in {"content-length", "transfer-encoding", "connection"}
+    }
+    return Response(
+        content=upstream.content,
+        status_code=upstream.status_code,
+        headers=response_headers,
+        media_type=upstream.headers.get("content-type"),
+    )
 
 
 def service_response(service) -> ServiceResponse:

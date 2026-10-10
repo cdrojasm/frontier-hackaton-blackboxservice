@@ -1,4 +1,7 @@
 from datetime import datetime
+import hashlib
+import re
+import secrets
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -16,6 +19,7 @@ from frontier_api.infra.db.models import (
     MimicRunModel,
     ReplayResultModel,
     RunEventModel,
+    ServiceModel,
     ServiceCredentialModel,
     ServiceRequestModel,
 )
@@ -222,6 +226,73 @@ async def update_mimic_run(run_id: UUID, payload: GenericPayload, session: Async
     await session.commit()
     await session.refresh(row)
     return serialize(row)
+
+
+def _slugify(value: str) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "-", value.lower()).strip("-")
+    return slug or "mimic"
+
+
+@router.post("/mimic-runs/{run_id}/approve")
+async def approve_mimic_run(run_id: UUID, session: AsyncSession = Depends(get_session)):
+    run = await get_model(session, MimicRunModel, run_id)
+    if run.status != "approval_required":
+        raise HTTPException(status_code=409, detail=f"Run is not awaiting approval: {run.status}")
+    service = await session.get(ServiceModel, run.service_id)
+    if service is None:
+        raise HTTPException(status_code=404, detail="Service not found")
+    clone = await session.scalar(select(ClonedServiceModel).where(ClonedServiceModel.service_id == service.id))
+    if clone is None:
+        base_slug = _slugify(service.name)
+        slug = base_slug
+        suffix = 2
+        while await session.scalar(select(ClonedServiceModel.id).where(ClonedServiceModel.slug == slug)) is not None:
+            slug = f"{base_slug}-{suffix}"
+            suffix += 1
+        clone = ClonedServiceModel(service_id=service.id, slug=slug, enabled=False)
+        session.add(clone)
+        await session.flush()
+    elif clone.slug.startswith("replay-"):
+        base_slug = _slugify(service.name)
+        slug = base_slug
+        suffix = 2
+        while await session.scalar(select(ClonedServiceModel.id).where(
+            ClonedServiceModel.slug == slug,
+            ClonedServiceModel.id != clone.id,
+        )) is not None:
+            slug = f"{base_slug}-{suffix}"
+            suffix += 1
+        clone.slug = slug
+    clone.active_mimic_run_id = run.id
+    run.status = "ready"
+    run.finished_at = datetime.now()
+    session.add(RunEventModel(mimic_run_id=run.id, step="approved", level="info", message="Mimic artifact approved and ready to ship"))
+    await session.commit()
+    await session.refresh(clone)
+    return {"run": serialize(run), "clone": serialize(clone, redact_secret=True)}
+
+
+@router.post("/cloned-services/{clone_id}/ship")
+async def ship_clone(clone_id: UUID, session: AsyncSession = Depends(get_session)):
+    clone = await get_model(session, ClonedServiceModel, clone_id)
+    if clone.active_mimic_run_id is None:
+        raise HTTPException(status_code=409, detail="Clone has no approved mimic run")
+    token = secrets.token_urlsafe(32)
+    clone.token_hash = hashlib.sha256(token.encode()).hexdigest()
+    clone.token_prefix = token[:8]
+    clone.enabled = True
+    await session.commit()
+    await session.refresh(clone)
+    return {"clone": serialize(clone, redact_secret=True), "token": token}
+
+
+@router.post("/cloned-services/{clone_id}/disable")
+async def disable_clone(clone_id: UUID, session: AsyncSession = Depends(get_session)):
+    clone = await get_model(session, ClonedServiceModel, clone_id)
+    clone.enabled = False
+    await session.commit()
+    await session.refresh(clone)
+    return serialize(clone, redact_secret=True)
 
 
 @router.get("/cloned-services")
