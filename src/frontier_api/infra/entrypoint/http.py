@@ -31,6 +31,11 @@ async def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
+@router.get("/api/health")
+async def api_health() -> dict[str, str]:
+    return {"status": "ok"}
+
+
 def service_response(service) -> ServiceResponse:
     return ServiceResponse(
         id=service.id,

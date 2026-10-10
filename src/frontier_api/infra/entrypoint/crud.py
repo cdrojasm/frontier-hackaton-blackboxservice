@@ -87,6 +87,39 @@ async def create_discovery_run(service_id: UUID, payload: GenericPayload, sessio
     return serialize(row)
 
 
+@router.post("/services/{service_id}/discovery-runs/import", status_code=status.HTTP_201_CREATED)
+async def import_discovery_run(service_id: UUID, payload: GenericPayload, session: AsyncSession = Depends(get_session)):
+    requests = payload.data.get("requests", [])
+    if not isinstance(requests, list):
+        raise HTTPException(status_code=400, detail="requests must be a list")
+    run = DiscoveryRunModel(
+        service_id=service_id,
+        config={"mode": payload.data.get("mode", "react"), "seed_count": len(requests)},
+    )
+    session.add(run)
+    await session.flush()
+    for index, item in enumerate(requests):
+        if not isinstance(item, dict) or not item.get("method") or not item.get("path"):
+            raise HTTPException(status_code=400, detail=f"Invalid request at index {index}")
+        session.add(
+            ServiceRequestModel(
+                service_id=service_id,
+                source_run_id=run.id,
+                sequence_id=uuid4(),
+                sequence_order=int(item.get("sequence_order", index)),
+                type="seed",
+                method=str(item["method"]).upper(),
+                path=str(item["path"]),
+                payload_ref=item.get("payload_ref"),
+                response_code=item.get("response_code"),
+                response_ref=item.get("response_ref"),
+            )
+        )
+    await session.commit()
+    await session.refresh(run)
+    return serialize(run)
+
+
 @router.get("/discovery-runs/{run_id}")
 async def get_discovery_run(run_id: UUID, session: AsyncSession = Depends(get_session)):
     return serialize(await get_model(session, DiscoveryRunModel, run_id))
@@ -106,6 +139,18 @@ async def update_discovery_run(run_id: UUID, payload: GenericPayload, session: A
 async def list_service_requests(service_id: UUID | None = None, session: AsyncSession = Depends(get_session)):
     rows = await list_models(session, ServiceRequestModel, {"service_id": service_id} if service_id else None)
     return [serialize(row) for row in rows]
+
+
+@router.get("/services/{service_id}/credentials")
+async def list_service_credentials(service_id: UUID, session: AsyncSession = Depends(get_session)):
+    rows = await list_models(session, ServiceCredentialModel, {"service_id": service_id})
+    return [serialize(row, redact_secret=True) for row in rows]
+
+
+@router.post("/services/{service_id}/credentials", status_code=status.HTTP_201_CREATED)
+async def create_service_credential(service_id: UUID, payload: GenericPayload, session: AsyncSession = Depends(get_session)):
+    row = await create_model(session, ServiceCredentialModel, {"service_id": service_id, **payload.data})
+    return serialize(row, redact_secret=True)
 
 
 @router.post("/services/{service_id}/requests", status_code=status.HTTP_201_CREATED)
@@ -206,8 +251,48 @@ async def list_run_events(discovery_run_id: UUID | None = None, mimic_run_id: UU
     filters = {"discovery_run_id": discovery_run_id} if discovery_run_id else {}
     if mimic_run_id:
         filters = {"mimic_run_id": mimic_run_id}
-    rows = await list_models(session, RunEventModel, filters)
-    return [serialize(row) for row in rows]
+    query = select(RunEventModel)
+    for key, value in filters.items():
+        query = query.where(getattr(RunEventModel, key) == value)
+    query = query.order_by(RunEventModel.created_at, RunEventModel.id)
+    rows = list((await session.scalars(query)).all())
+
+    # Older worker versions stored only "POST /path -> status" in the event.
+    # Enrich those events from the request row so the UI also works for runs
+    # that were completed before the payload/response event format existed.
+    request_by_position: dict[UUID, list[ServiceRequestModel]] = {}
+    if discovery_run_id:
+        requests = list((await session.scalars(
+            select(ServiceRequestModel)
+            .where(ServiceRequestModel.source_run_id == discovery_run_id)
+            .order_by(ServiceRequestModel.sequence_id, ServiceRequestModel.sequence_order)
+        )).all())
+        request_by_position[discovery_run_id] = requests
+
+    def inline_value(value: str | None) -> Any:
+        if not value:
+            return None
+        return value.removeprefix("inline:") if value.startswith("inline:") else value
+
+    result = []
+    for row in rows:
+        item = serialize(row)
+        if discovery_run_id and row.step == "executing_requests" and row.progress_done and "payload=" not in row.message:
+            request = request_by_position[discovery_run_id][row.progress_done - 1] if row.progress_done <= len(request_by_position[discovery_run_id]) else None
+            if request is not None:
+                item["payload"] = inline_value(request.payload_ref)
+                item["response"] = inline_value(request.response_ref)
+                item["response_code"] = request.response_code
+                item["request_id"] = str(request.id)
+                if "payload=" not in item["message"]:
+                    payload_text = item["payload"] if item["payload"] is not None else "<empty>"
+                    response_text = item["response"] if item["response"] is not None else (request.error or "<empty>")
+                    item["message"] = (
+                        f"{item['message']} | payload={payload_text} | "
+                        f"response={response_text}"
+                    )[:4_000]
+        result.append(item)
+    return result
 
 
 @router.get("/replay-results")

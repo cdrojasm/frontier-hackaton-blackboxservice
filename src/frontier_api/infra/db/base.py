@@ -18,7 +18,11 @@ def _async_database_url(url: str) -> str:
     return url
 
 
-engine = create_async_engine(_async_database_url(get_settings().database_url), pool_pre_ping=True)
+engine = create_async_engine(
+    _async_database_url(get_settings().database_url),
+    pool_pre_ping=True,
+    connect_args={"connect_timeout": 5},
+)
 SessionFactory = async_sessionmaker(engine, expire_on_commit=False)
 
 
