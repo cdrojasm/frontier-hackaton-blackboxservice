@@ -21,6 +21,7 @@ from frontier_api.artifact_store import store_artifact
 from frontier_api.infra.db.base import SessionFactory, engine
 from frontier_api.infra.db.models import (
     ClonedServiceModel,
+    DiscoveryRunModel,
     InsightModel,
     MimicRecordModel,
     MimicRunInsightModel,
@@ -220,9 +221,20 @@ async def _replay_one(spec: dict, request: ServiceRequestModel, context: Runtime
 
 
 async def _memory_replay(spec: dict, requests: list[ServiceRequestModel]) -> list[dict[str, object] | None]:
-    """Score a spec chronologically against one shared in-memory store (no DB round-trips)."""
+    """Score a spec chronologically in memory (no DB round-trips).
+
+    Every discovery run starts from the original's empty (reset) state, so the
+    store is recreated whenever the source run changes.
+    """
+    results: list[dict[str, object] | None] = []
+    current_run: object = object()
     context = RuntimeContext(MemoryStore())
-    return [await _replay_one(spec, request, context) for request in requests]
+    for request in requests:
+        if request.source_run_id != current_run:
+            current_run = request.source_run_id
+            context = RuntimeContext(MemoryStore())
+        results.append(await _replay_one(spec, request, context))
+    return results
 
 
 def _with_request(request: ServiceRequestModel, diff: dict[str, object]) -> dict[str, object]:
@@ -246,13 +258,18 @@ async def _run_replay(
     """Validate a spec against the PostgreSQL-backed store and persist replay results.
 
     The real service keeps state across sequences (ID counters, balances), so
-    every captured request is replayed chronologically in one shared namespace.
+    every captured request is replayed chronologically in one shared namespace
+    per discovery run, each starting empty like the reset original.
     """
     matched = 0
     diffs: list[dict[str, object]] = []
-    namespace = f"replay-{run.id}-{iteration}"
-    context = RuntimeContext(RuntimeStore(session, clone.id, namespace))
+    prefix = f"replay-{run.id}-{iteration}"
+    current_run: object = object()
+    context = RuntimeContext(RuntimeStore(session, clone.id, prefix))
     for request in requests:
+        if request.source_run_id != current_run:
+            current_run = request.source_run_id
+            context = RuntimeContext(RuntimeStore(session, clone.id, f"{prefix}-{current_run}"))
         diff = await _replay_one(spec, request, context)
         matched += int(diff is None)
         if diff is not None:
@@ -266,13 +283,18 @@ async def _run_replay(
         ))
     await session.execute(delete(MimicRecordModel).where(
         MimicRecordModel.cloned_service_id == clone.id,
-        MimicRecordModel.namespace == namespace,
+        MimicRecordModel.namespace.startswith(prefix),
     ))
     return matched, len(requests), diffs
 
 
-async def process_run(run: MimicRunModel) -> None:
+async def process_run(claimed: MimicRunModel) -> None:
     async with SessionFactory() as session:
+        # The claimed instance belongs to the (closed) claim session; changes to it
+        # would never be flushed, losing status, match_rate and code_ref.
+        run = await session.get(MimicRunModel, claimed.id)
+        if run is None:
+            return
         service = await session.get(ServiceModel, run.service_id)
         if service is None:
             await _fail(session, run.id, "Service not found")
@@ -293,18 +315,38 @@ async def process_run(run: MimicRunModel) -> None:
         await _event(session, run.id, "collecting_insights", f"Using {len(insights)} validated insights")
         await session.commit()
 
+        # Only traffic captured right after a successful POST /__reset on the
+        # original reflects the empty initial state; older runs carry leftover
+        # state that would teach the mimic to hardcode seed data.
+        discovery_runs = list((await session.scalars(
+            select(DiscoveryRunModel).where(DiscoveryRunModel.service_id == service.id)
+        )).all())
+        clean_runs = [
+            item.id for item in discovery_runs
+            if isinstance((item.config or {}).get("reset_status"), int) and 200 <= item.config["reset_status"] < 300
+        ]
+        request_filter = [ServiceRequestModel.service_id == service.id, ServiceRequestModel.response_code.is_not(None)]
+        if clean_runs:
+            request_filter.append(ServiceRequestModel.source_run_id.in_(clean_runs))
+            await _event(session, run.id, "clean_state", f"Using {len(clean_runs)} discovery run(s) captured from an empty (reset) original")
+        else:
+            await _event(session, run.id, "clean_state", "No discovery run started with POST /__reset; captured state may not be empty", "warning")
         requests = list((await session.scalars(
             select(ServiceRequestModel)
-            .where(ServiceRequestModel.service_id == service.id)
-            # Chronological order reproduces the state the real service accumulated.
+            .where(*request_filter)
+            # Chronological order reproduces the state built inside each run.
             .order_by(
                 ServiceRequestModel.executed_at.asc().nulls_last(),
                 ServiceRequestModel.created_at,
                 ServiceRequestModel.sequence_order,
             )
         )).all())
+        run_index: dict[object, int] = {}
+        for item in requests:
+            run_index.setdefault(item.source_run_id, len(run_index) + 1)
         evidence = [
             {
+                "run": run_index[item.source_run_id],
                 "method": item.method,
                 "path": item.path,
                 "status": item.response_code,

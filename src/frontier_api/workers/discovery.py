@@ -53,6 +53,9 @@ def _env_int(name: str, default: int) -> int:
 POLL_INTERVAL_SECONDS = _env_float("DISCOVERY_WORKER_POLL_INTERVAL_SECONDS", 2.0)
 REQUEST_TIMEOUT_SECONDS = _env_float("DISCOVERY_REQUEST_TIMEOUT_SECONDS", 30.0)
 RESPONSE_LIMIT_BYTES = _env_int("DISCOVERY_INLINE_RESPONSE_LIMIT_BYTES", 64_000)
+# Captured traffic must start from the original's EMPTY state; otherwise the
+# mimic learns (and hardcodes) whatever state earlier runs left behind.
+RESET_ORIGINAL = os.getenv("DISCOVERY_RESET_ORIGINAL", "true").lower() not in {"0", "false", "no"}
 
 
 def _is_private_address(host: str) -> bool:
@@ -410,6 +413,31 @@ async def _execute_pending(
     return failed
 
 
+async def _reset_original(
+    session: AsyncSession,
+    run_id: UUID,
+    service: ServiceModel,
+    headers: dict[str, str],
+) -> None:
+    """POST /__reset on the original so this run is captured from the empty state."""
+    run = await session.get(DiscoveryRunModel, run_id)
+    if run is None:
+        return
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(REQUEST_TIMEOUT_SECONDS), follow_redirects=False) as client:
+            response = await client.post(_validate_target(service.base_url, "/__reset"), headers=headers)
+        status_code: int | None = response.status_code
+        message = f"POST /__reset → {status_code} | estado inicial vacío" if response.is_success else (
+            f"POST /__reset → {status_code}; el estado del original puede no estar vacío"
+        )
+    except Exception as exc:  # noqa: BLE001 - discovery continues, but the run is marked unreset
+        status_code = None
+        message = f"POST /__reset failed: {exc}"[:4_000]
+    run.config = {**(run.config or {}), "reset_status": status_code}
+    await _add_event(session, run_id, "reset_original", message, 0, 0, "info" if status_code and status_code < 300 else "warning")
+    await session.commit()
+
+
 async def process_run(run: DiscoveryRunModel) -> None:
     async with SessionFactory() as session:
         service = await session.get(ServiceModel, run.service_id)
@@ -418,6 +446,8 @@ async def process_run(run: DiscoveryRunModel) -> None:
             return
 
         headers = await _service_headers(session, service.id)
+        if RESET_ORIGINAL:
+            await _reset_original(session, run.id, service, headers)
         iteration = 0
         while True:
             failed = await _execute_pending(session, run, service, headers)

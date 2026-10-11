@@ -46,6 +46,9 @@ HANDLER_CONSTRAINTS = [
     "Return Response(status, body) where body is a JSON-serializable value, not a JSON string.",
     "Use await ctx.store.table('name').get/put/delete/list/next_id for state.",
     "Follow state_model exactly (table names, keys, fields, ID formats) so handlers of other endpoints interoperate.",
+    ("STATE STARTS EMPTY: at the start of every discovery run (field `run` in observed_evidence) the original was "
+     "reset, so there are no records and every ID counter starts at 1. Never seed, preload or hardcode records, "
+     "counters, balances or IDs in handler code; a missing record must produce the not-found behavior."),
     ("Replay runs every observed request in chronological order against ONE shared store: "
     "IDs, counters and balances accumulate across sequences exactly as in observed_evidence."),
     "Do not hardcode observed response values; derive them from state and the request.",
@@ -168,6 +171,8 @@ async def generate_pipeline(
             ("design.state_model is the shared storage contract every handler will follow: one table per entity, "
             "ID formats (e.g. AC-%04d from a next_id counter), and fields such as balances that other endpoints update."),
             "State persists across sequences (ID counters, balances, status transitions).",
+            ("State starts EMPTY at the beginning of each discovery run (field `run`): no records, counters at 1. "
+             "Never plan seed data or preloaded records."),
             "Use stable IDs so later phases can trace rules and tasks back to evidence.",
         ],
     }
